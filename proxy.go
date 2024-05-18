@@ -56,7 +56,7 @@ type Proxy struct {
 	roundTripper http.RoundTripper
 	dial         func(string, string) (net.Conn, error)
 	timeout      time.Duration
-	mitm         *mitm.Config
+	mitm         *mitm.Config //MITM
 	proxyURL     *url.URL
 	conns        sync.WaitGroup
 	connsMu      sync.Mutex // protects conns.Add/Wait from concurrent access
@@ -67,11 +67,14 @@ type Proxy struct {
 }
 
 // NewProxy returns a new HTTP proxy.
+
+// 本端的服务，用于自己作为代理提供给客户端访问
 func NewProxy() *Proxy {
 	proxy := &Proxy{
 		roundTripper: &http.Transport{
 			// TODO(adamtanner): This forces the http.Transport to not upgrade requests
 			// to HTTP/2 in Go 1.6+. Remove this once Martian can support HTTP/2.
+			//TLSNextProto: 这是一个映射，用于指定不同协议版本的处理函数。在这里，它被设置为空映射，以阻止http.Transport在Go 1.6+中将请求升级到HTTP/2。一旦Martian支持HTTP/2，这段代码应该会被移除
 			TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
 			Proxy:                 http.ProxyFromEnvironment,
 			TLSHandshakeTimeout:   10 * time.Second,
@@ -148,6 +151,7 @@ func (p *Proxy) Close() {
 
 	log.Infof("martian: waiting for connections to close")
 	p.connsMu.Lock()
+	//等待所有链接退出
 	p.conns.Wait()
 	p.connsMu.Unlock()
 	log.Infof("martian: all connections closed")
@@ -229,7 +233,9 @@ func (p *Proxy) Serve(l net.Listener) error {
 	}
 }
 
+// 异步处理单个mitm连接
 func (p *Proxy) handleLoop(conn net.Conn) {
+	//为啥要加锁？
 	p.connsMu.Lock()
 	p.conns.Add(1)
 	p.connsMu.Unlock()
@@ -239,8 +245,15 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 		return
 	}
 
+	/*
+		创建了一个 bufio.ReadWriter 结构体实例，它是一个缓冲读写器，用于从 conn 连接中读取数据和向 conn 连接写入数据。以下是对这段代码的详细解释：
+		bufio.NewReader(conn): 这个函数创建了一个新的缓冲读取器（bufio.Reader），它将从 conn 连接中读取数据。缓冲读取器可以提高 I/O 效率，因为它会一次性从底层连接中读取较大块的数据，并将其存储在内部缓冲区中，以便以后按需读取。
+		bufio.NewWriter(conn): 这个函数创建了一个新的缓冲写入器（bufio.Writer），它将向 conn 连接写入数据。缓冲写入器可以提高 I/O 效率，因为它会将要写入的数据先存储在内部缓冲区中，然后在缓冲区满时或调用 Flush() 函数时一次性写入底层连接。
+		bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)): 这个函数创建了一个新的缓冲读写器（bufio.ReadWriter），它是一个组合了缓冲读取器和缓冲写入器功能的结构体。通过使用 bufio.ReadWriter，你可以方便地在同一个连接上进行缓冲的读取和写入操作。
+	*/
 	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
+	// 构建新session
 	s, err := newSession(conn, brw)
 	if err != nil {
 		log.Errorf("martian: failed to create session: %v", err)
@@ -253,6 +266,12 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 		return
 	}
 
+	/*
+
+		这个 for 循环用于在代理服务器和客户端之间建立会话，并且持续监听和处理来自客户端的请求。如果代理服务器正在关闭，循环会退出并关闭连接。在每次循环中，会设置一个读取和写入操作的截止时间，以确保在超时的情况下不会一直等待。如果在处理请求时出现了可以关闭连接的错误，循环会退出并关闭连接。
+	*/
+
+	//考虑长连接的case，循环处理
 	for {
 		deadline := time.Now().Add(p.timeout)
 		conn.SetDeadline(deadline)
@@ -264,6 +283,7 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	}
 }
 
+// 异步处理请求读取
 func (p *Proxy) readRequest(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) (*http.Request, error) {
 	var req *http.Request
 	reqc := make(chan *http.Request, 1)
@@ -439,9 +459,11 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 	return errClose
 }
 
+// handle ：处理HTTPSmitm代理逻辑
 func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error {
 	log.Debugf("martian: waiting for request: %v", conn.RemoteAddr())
 
+	// 读取请求
 	req, err := p.readRequest(ctx, conn, brw)
 	if err != nil {
 		return err

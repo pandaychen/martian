@@ -17,6 +17,8 @@
 // a TLS connection with a provided CA certificate.
 package mitm
 
+//mitm：faketlsserver使用的TLS配置封装
+
 import (
 	"bytes"
 	"crypto/rand"
@@ -51,13 +53,13 @@ type Config struct {
 	validity               time.Duration
 	org                    string
 	h2Config               *h2.Config
-	getCertificate         func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	getCertificate         func(*tls.ClientHelloInfo) (*tls.Certificate, error) //根据tls握手信息获取证书
 	roots                  *x509.CertPool
 	skipVerify             bool
 	handshakeErrorCallback func(*http.Request, error)
 
 	certmu sync.RWMutex
-	certs  map[string]*tls.Certificate
+	certs  map[string]*tls.Certificate //存储certs
 }
 
 // NewAuthority creates a new CA certificate and associated
@@ -194,15 +196,21 @@ func (c *Config) HandshakeErrorCallback(r *http.Request, err error) {
 // the SNI extension in the TLS ClientHello.
 func (c *Config) TLS() *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: c.skipVerify,
+		InsecureSkipVerify: c.skipVerify, //跳过证书校验
 		GetCertificate: func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if clientHello.ServerName == "" {
 				return nil, errors.New("mitm: SNI not provided, failed to build certificate")
 			}
 
+			//获取sni对应的证书
 			return c.cert(clientHello.ServerName)
 		},
 		NextProtos: []string{"http/1.1"},
+		/*
+			InsecureSkipVerify: 这个字段设置为 c.skipVerify，用于确定是否跳过服务器证书验证。如果设置为 true，客户端将不会验证服务器的证书，这可能导致安全问题。通常，这个选项仅用于测试或调试。
+			GetCertificate: 这是一个函数，它接收一个 *tls.ClientHelloInfo 参数，并返回一个 *tls.Certificate 和一个错误。在这个例子中，函数首先检查客户端的 "Server Name Indication" (SNI) 是否为空。如果为空，函数返回一个错误，表示无法生成证书。如果 SNI 不为空，函数使用 c.cert(clientHello.ServerName) 为指定的服务器名生成证书。
+			NextProtos: 这是一个字符串切片，包含了支持的应用层协议。在这个例子中，它设置为 ["http/1.1"]，表示仅支持 HTTP/1.1 协议。
+		*/
 	}
 }
 
@@ -211,6 +219,7 @@ func (c *Config) TLS() *tls.Config {
 func (c *Config) TLSForHost(hostname string) *tls.Config {
 	nextProtos := []string{"http/1.1"}
 	if c.h2AllowedHost(hostname) {
+		//服务其提供HTTP2+HTTP1.1的选项
 		nextProtos = []string{"h2", "http/1.1"}
 	}
 	return &tls.Config{
@@ -233,6 +242,7 @@ func (c *Config) h2AllowedHost(host string) bool {
 		c.h2Config.AllowedHostsFilter(host)
 }
 
+// 根据sni获取证书
 func (c *Config) cert(hostname string) (*tls.Certificate, error) {
 	// Remove the port if it exists.
 	host, _, err := net.SplitHostPort(hostname)

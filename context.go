@@ -27,6 +27,7 @@ import (
 // Context provides information and storage for a single request/response pair.
 // Contexts are linked to shared session that is used for multiple requests on
 // a single connection.
+// Context 为单个请求/响应对提供信息和存储。 // 上下文与共享会话相关联，该会话用于单个连接上的多个请求。
 type Context struct {
 	session *Session
 	id      string
