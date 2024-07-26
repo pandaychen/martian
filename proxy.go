@@ -186,6 +186,7 @@ func (p *Proxy) SetResponseModifier(resmod ResponseModifier) {
 }
 
 // Serve accepts connections from the listener and handles the requests.
+// Serve：CONNECT代理+MTTM的核心实现
 func (p *Proxy) Serve(l net.Listener) error {
 	defer l.Close()
 
@@ -229,6 +230,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 			tconn.SetKeepAlivePeriod(3 * time.Minute)
 		}
 
+		//
 		go p.handleLoop(conn)
 	}
 }
@@ -247,9 +249,9 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 
 	/*
 		创建了一个 bufio.ReadWriter 结构体实例，它是一个缓冲读写器，用于从 conn 连接中读取数据和向 conn 连接写入数据。以下是对这段代码的详细解释：
-		bufio.NewReader(conn): 这个函数创建了一个新的缓冲读取器（bufio.Reader），它将从 conn 连接中读取数据。缓冲读取器可以提高 I/O 效率，因为它会一次性从底层连接中读取较大块的数据，并将其存储在内部缓冲区中，以便以后按需读取。
-		bufio.NewWriter(conn): 这个函数创建了一个新的缓冲写入器（bufio.Writer），它将向 conn 连接写入数据。缓冲写入器可以提高 I/O 效率，因为它会将要写入的数据先存储在内部缓冲区中，然后在缓冲区满时或调用 Flush() 函数时一次性写入底层连接。
-		bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)): 这个函数创建了一个新的缓冲读写器（bufio.ReadWriter），它是一个组合了缓冲读取器和缓冲写入器功能的结构体。通过使用 bufio.ReadWriter，你可以方便地在同一个连接上进行缓冲的读取和写入操作。
+		bufio.NewReader(conn): 这个函数创建了一个新的缓冲读取器（bufio.Reader），它将从 conn 连接中读取数据。缓冲读取器可以提高 I/O 效率，因为它会一次性从底层连接中读取较大块的数据，并将其存储在内部缓冲区中，以便以后按需读取
+		bufio.NewWriter(conn): 这个函数创建了一个新的缓冲写入器（bufio.Writer），它将向 conn 连接写入数据。缓冲写入器可以提高 I/O 效率，因为它会将要写入的数据先存储在内部缓冲区中，然后在缓冲区满时或调用 Flush() 函数时一次性写入底层连接
+		bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)): 这个函数创建了一个新的缓冲读写器（bufio.ReadWriter），它是一个组合了缓冲读取器和缓冲写入器功能的结构体。通过使用 bufio.ReadWriter，你可以方便地在同一个连接上进行缓冲的读取和写入操作
 	*/
 	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
@@ -315,6 +317,7 @@ func (p *Proxy) readRequest(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) 
 	return req, nil
 }
 
+// handleConnectRequest：处理HTTP CONNECT逻辑
 func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *Session, brw *bufio.ReadWriter, conn net.Conn) error {
 	if err := p.reqmod.ModifyRequest(req); err != nil {
 		log.Errorf("martian: error modifying CONNECT request: %v", err)
@@ -326,6 +329,7 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 	}
 
 	if p.mitm != nil {
+		//开启MITM处理
 		log.Debugf("martian: attempting MITM for connection: %s / %s", req.Host, req.URL.String())
 
 		res := proxyutil.NewResponse(200, nil, req)
@@ -349,6 +353,7 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		log.Debugf("martian: completed MITM for connection: %s", req.Host)
 
 		b := make([]byte, 1)
+		// 只读1个字节
 		if _, err := brw.Read(b); err != nil {
 			log.Errorf("martian: error peeking message through CONNECT tunnel to determine type: %v", err)
 		}
@@ -362,12 +367,18 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		if b[0] == 22 {
 			// Prepend the previously read data to be read again by
 			// http.ReadRequest.
+
+			//martain用CONNECT中的域名 做代理
+
+			//构建faketls配置
 			tlsconn := tls.Server(&peekedConn{conn, io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn)}, p.mitm.TLSForHost(req.Host))
 
 			if err := tlsconn.Handshake(); err != nil {
 				p.mitm.HandshakeErrorCallback(req, err)
 				return err
 			}
+
+			// if H2 protocol
 			if tlsconn.ConnectionState().NegotiatedProtocol == "h2" {
 				return p.mitm.H2Config().Proxy(p.closing, tlsconn, req.URL)
 			}
@@ -459,11 +470,11 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 	return errClose
 }
 
-// handle ：处理HTTPSmitm代理逻辑
+// handle ：处理HTTPS-mitm代理逻辑
 func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error {
 	log.Debugf("martian: waiting for request: %v", conn.RemoteAddr())
 
-	// 读取请求
+	// 读取请求（readRequest的用法）
 	req, err := p.readRequest(ctx, conn, brw)
 	if err != nil {
 		return err
@@ -509,9 +520,11 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	}
 
 	if req.Method == "CONNECT" {
+		// phase 1：curl https://www.baidu.com
 		return p.handleConnectRequest(ctx, req, session, brw, conn)
 	}
 
+	// phase 2：curl http://www.baidu.com
 	// Not a CONNECT request
 	if err := p.reqmod.ModifyRequest(req); err != nil {
 		log.Errorf("martian: error modifying request: %v", err)
@@ -608,6 +621,8 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 
 // A peekedConn subverts the net.Conn.Read implementation, primarily so that
 // sniffed bytes can be transparently prepended.
+
+// peekedConn主要是为了改变net.Conn.Read的实现，主要是为了能够透明地添加被嗅探的字节。
 type peekedConn struct {
 	net.Conn
 	r io.Reader

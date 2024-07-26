@@ -216,6 +216,8 @@ func (c *Config) TLS() *tls.Config {
 
 // TLSForHost returns a *tls.Config that will generate certificates on-the-fly
 // using SNI from the connection, or fall back to the provided hostname.
+
+// 优先使用servername，如果servername为空则使用hostname
 func (c *Config) TLSForHost(hostname string) *tls.Config {
 	nextProtos := []string{"http/1.1"}
 	if c.h2AllowedHost(hostname) {

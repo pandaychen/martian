@@ -283,6 +283,7 @@ func unlink(req *http.Request) {
 }
 
 // newSession builds a new session.
+// 长连接场景，为连接上的每个req/resp构建session
 func newSession(conn net.Conn, brw *bufio.ReadWriter) (*Session, error) {
 	sid, err := newID()
 	if err != nil {

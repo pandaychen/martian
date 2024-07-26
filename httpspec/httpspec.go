@@ -26,6 +26,8 @@ import (
 // NewStack returns a martian modifier stack that handles ensuring proper proxy
 // behavior, in addition to a fifo.Group that can be used to add additional
 // modifiers within the stack.
+
+// NewStack：基于fifo策略的request/response修改器列表
 func NewStack(via string) (outer *fifo.Group, inner *fifo.Group) {
 	outer = fifo.NewGroup()
 

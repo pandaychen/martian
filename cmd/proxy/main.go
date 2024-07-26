@@ -282,11 +282,13 @@ func main() {
 	p := martian.NewProxy()
 	defer p.Close()
 
+	// 普通的http connect代理监听器
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	//
 	lAPI, err := net.Listen("tcp", *apiAddr)
 	if err != nil {
 		log.Fatal(err)
@@ -294,6 +296,7 @@ func main() {
 
 	log.Printf("martian: starting proxy on %s and api on %s", l.Addr().String(), lAPI.Addr().String())
 
+	//用于mitm向真实服务器发起访问的client端
 	tr := &http.Transport{
 		Dial: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -307,6 +310,7 @@ func main() {
 	}
 	p.SetRoundTripper(tr)
 
+	// 下游访问是否要走代理
 	if *dsProxyURL != "" {
 		u, err := url.Parse(*dsProxyURL)
 		if err != nil {
@@ -320,6 +324,7 @@ func main() {
 	var x509c *x509.Certificate
 	var priv interface{}
 
+	/*初始化MITM配置*/
 	if *generateCA {
 		var err error
 		x509c, priv, err = mitm.NewAuthority("martian.proxy", "Martian Authority", 30*24*time.Hour)
@@ -339,6 +344,7 @@ func main() {
 		}
 	}
 
+	// 初始化MITM用到的配置
 	if x509c != nil && priv != nil {
 		mc, err := mitm.NewConfig(x509c, priv)
 		if err != nil {
@@ -349,6 +355,7 @@ func main() {
 		mc.SetOrganization(*organization)
 		mc.SkipTLSVerify(*skipTLSVerify)
 
+		//存储mitm config
 		p.SetMITM(mc)
 
 		// Expose certificate authority.
@@ -361,6 +368,8 @@ func main() {
 			log.Fatal(err)
 		}
 
+		// ？
+		// 去掉这段逻辑好像也没影响？
 		go p.Serve(tls.NewListener(tl, mc.TLS()))
 	}
 
@@ -423,7 +432,7 @@ func main() {
 		muxf := servemux.NewFilter(mux)
 		muxf.RequestWhenFalse(lsm)
 		muxf.ResponseWhenFalse(lsm)
-		stack.AddRequestModifier(muxf)
+		stack.AddRequestModifier(muxf) //记录日志，有点类似于链式middleware的实现
 		stack.AddResponseModifier(muxf)
 
 		// retrieve binary marbl logs
@@ -453,6 +462,7 @@ func main() {
 		l = tsl
 	}
 
+	// mitm CONNECT 代理
 	go p.Serve(l)
 
 	go http.Serve(lAPI, mux)
