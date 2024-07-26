@@ -230,7 +230,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 			tconn.SetKeepAlivePeriod(3 * time.Minute)
 		}
 
-		//
+		// http(s)长短连接
 		go p.handleLoop(conn)
 	}
 }
@@ -244,6 +244,7 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	defer p.conns.Done()
 	defer conn.Close()
 	if p.Closing() {
+		//被动关闭
 		return
 	}
 
@@ -255,7 +256,7 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	*/
 	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
-	// 构建新session
+	// 构建新session，同时将conn关联到这个session
 	s, err := newSession(conn, brw)
 	if err != nil {
 		log.Errorf("martian: failed to create session: %v", err)
@@ -274,6 +275,7 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	*/
 
 	//考虑长连接的case，循环处理
+	// 比较典型的实现
 	for {
 		deadline := time.Now().Add(p.timeout)
 		conn.SetDeadline(deadline)
@@ -285,12 +287,18 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	}
 }
 
-// 异步处理请求读取
+// readRequest：异步处理请求读取
 func (p *Proxy) readRequest(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) (*http.Request, error) {
 	var req *http.Request
 	reqc := make(chan *http.Request, 1)
 	errc := make(chan error, 1)
 	go func() {
+		//按照http协议读取brw
+		/*
+			从一个 bufio.ReadWriter（brw）中读取并解析一个 HTTP 请求。
+			http.ReadRequest 是 Go 语言中 net/http 包的一个函数，它接收一个实现了 io.Reader 接口的参数，用于从中读取数据。在这个例子中，参数是 brw.Reader，即 bufio.ReadWriter 的读取部分（brw 是一个指向 bufio.ReadWriter 类型的指针）。
+			函数返回两个值：r 和 err。r 是一个指向 http.Request 类型的指针，表示成功解析的 HTTP 请求对象；err 是一个错误对象，用于表示在读取或解析请求过程中遇到的任何错误。如果没有错误发生，err 将为 nil，否则你需要检查和处理错误。
+		*/
 		r, err := http.ReadRequest(brw.Reader)
 		if err != nil {
 			errc <- err
@@ -332,6 +340,7 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		//开启MITM处理
 		log.Debugf("martian: attempting MITM for connection: %s / %s", req.Host, req.URL.String())
 
+		// 构造200 OK回复response，tunnel建立
 		res := proxyutil.NewResponse(200, nil, req)
 
 		if err := p.resmod.ModifyResponse(res); err != nil {
@@ -343,6 +352,15 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 			return nil
 		}
 
+		/*
+			将一个 http.Response（res）对象写入到 bufio.ReadWriter（brw）中，并将缓冲区的数据刷新到底层的写入器。
+
+			if err := res.Write(brw); err != nil { ... }：这一部分使用 http.Response 的 Write 方法将响应对象 res 序列化为 HTTP 响应格式并写入到 bufio.ReadWriter（brw）的缓冲区中。如果在写入过程中遇到任何错误，将记录错误日志。
+
+			if err := brw.Flush(); err != nil { ... }：在将响应写入到 bufio.ReadWriter 的缓冲区之后，这一部分调用 Flush 方法将缓冲区的数据刷新到底层的写入器（通常是一个网络连接）。这样，HTTP 响应才会被发送回客户端。如果在刷新过程中遇到任何错误，将记录错误日志。
+
+			总之，这段代码的主要作用是将 http.Response 对象序列化并发送回客户端，同时处理可能遇到的任何错误。
+		*/
 		if err := res.Write(brw); err != nil {
 			log.Errorf("martian: got error while writing response back to client: %v", err)
 		}
@@ -351,6 +369,8 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		}
 
 		log.Debugf("martian: completed MITM for connection: %s", req.Host)
+
+		// 按照正常的协议流程来走，等待接收客户端的TLS（packet），如果第一个字节是22（十六进制16）
 
 		b := make([]byte, 1)
 		// 只读1个字节
@@ -479,7 +499,7 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	if err != nil {
 		return err
 	}
-	defer req.Body.Close()
+	defer req.Body.Close() //
 
 	session := ctx.Session()
 	ctx, err = withSession(session)
