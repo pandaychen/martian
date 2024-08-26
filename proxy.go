@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -256,6 +257,8 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 	*/
 	brw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
+	//本质上brw是对conn的优化式包装
+
 	// 构建新session，同时将conn关联到这个session
 	s, err := newSession(conn, brw)
 	if err != nil {
@@ -391,7 +394,14 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 			//martain用CONNECT中的域名 做代理
 
 			//构建faketls配置
-			tlsconn := tls.Server(&peekedConn{conn, io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn)}, p.mitm.TLSForHost(req.Host))
+
+			//在指定的net.Conn上构建tls conn
+			// 读走brw，写走conn，brw读取效率更高一些
+			// 这里是将客户端的TCPconn升级为tlsconn
+
+			// 注意这里MultiReader的用法io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn)
+			// 是将3个io.Reader对象，按顺序合并成一个
+			tlsconn := tls.Server(&peekedConn{conn, io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn)}, p.mitm.TLSForHost(req.Host) /*tls config*/)
 
 			if err := tlsconn.Handshake(); err != nil {
 				p.mitm.HandshakeErrorCallback(req, err)
@@ -400,6 +410,7 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 
 			// if H2 protocol
 			if tlsconn.ConnectionState().NegotiatedProtocol == "h2" {
+				// http2
 				return p.mitm.H2Config().Proxy(p.closing, tlsconn, req.URL)
 			}
 
@@ -410,6 +421,12 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 			if ptsconn, ok := conn.(*trafficshape.Conn); ok {
 				nconn = ptsconn.Listener.GetTrafficShapedConn(tlsconn)
 			}
+			/*
+				这段代码中的 Reset 是 bufio.Writer 和 bufio.Reader 的方法，它们分别用于重置 brw.Writer 和 brw.Reader 的底层连接为新的 net.Conn 对象（在这个例子中是 nconn，即 tlsconn）。
+				brw.Writer.Reset(nconn)：这一行代码将 brw.Writer 的底层连接重置为新的 net.Conn 对象 nconn。这意味着后续的写入操作将直接发送到 nconn。
+				brw.Reader.Reset(nconn)：这一行代码将 brw.Reader 的底层连接重置为新的 net.Conn 对象 nconn。这意味着后续的读取操作将直接从 nconn 读取数据。
+				这段代码的目的是将 bufio.ReadWriter 的底层连接切换到新的 net.Conn 对象，通常用于在底层连接发生变化时（例如，从普通连接升级到 TLS 连接）更新缓冲读写器。这样，在后续的读写操作中，brw 会使用新的底层连接进行数据传输。
+			*/
 			brw.Writer.Reset(nconn)
 			brw.Reader.Reset(nconn)
 			return p.handle(ctx, nconn, brw)
@@ -419,6 +436,8 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		brw.Reader.Reset(io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn))
 		return p.handle(ctx, conn, brw)
 	}
+
+	//未启用MITM的处理
 
 	log.Debugf("martian: attempting to establish CONNECT tunnel: %s", req.URL.Host)
 	res, cconn, cerr := p.connect(req)
@@ -491,10 +510,12 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 }
 
 // handle ：处理HTTPS-mitm代理逻辑
+// conn用于写数据
+// brw：用于读数据
 func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error {
 	log.Debugf("martian: waiting for request: %v", conn.RemoteAddr())
 
-	// 读取请求（readRequest的用法）
+	// 读取请求（readRequest的用法），这里是异步读
 	req, err := p.readRequest(ctx, conn, brw)
 	if err != nil {
 		return err
@@ -522,12 +543,19 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	}
 
 	if tconn, ok := conn.(*tls.Conn); ok {
+		//mitm https      //MarkSecure	tls会命中此处逻辑
 		session.MarkSecure()
 
 		cs := tconn.ConnectionState()
 		req.TLS = &cs
 	}
+	fmt.Println("for handle..", conn.RemoteAddr(), req.URL.Scheme, req.URL.Host, req.Host, req.Method)
+	/*
+		for handle.. 9.1.2.3:45360  www.baidu.com:443 www.baidu.com:443 CONNECT
+		for handle.. 9.1.2.3:45360   www.baidu.com GET	//注意是同一个tcp连接完成的
 
+		在CONNECT https场景中，p.handle会被调用两次
+	*/
 	req.URL.Scheme = "http"
 	if session.IsSecure() {
 		log.Infof("martian: forcing HTTPS inside secure session")
@@ -555,6 +583,9 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	}
 
 	// perform the HTTP roundtrip
+	// 执行原始客户端https访问
+
+	// 如果是get下载/post上传大文件场景，这里的性能如何？
 	res, err := p.roundTrip(ctx, req)
 	if err != nil {
 		log.Errorf("martian: failed to round trip: %v", err)
@@ -622,6 +653,8 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		}
 	}
 
+	// 将数据发送回客户端
+	// 这里其实不太喜欢martian的实现
 	err = res.Write(brw)
 	if err != nil {
 		log.Errorf("martian: got error while writing response back to client: %v", err)
@@ -651,6 +684,8 @@ type peekedConn struct {
 // Read allows control over the embedded net.Conn's read data. By using an
 // io.MultiReader one can read from a conn, and then replace what they read, to
 // be read again.
+
+// 替换掉net.Conn的Read方法
 func (c *peekedConn) Read(buf []byte) (int, error) { return c.r.Read(buf) }
 
 func (p *Proxy) roundTrip(ctx *Context, req *http.Request) (*http.Response, error) {
